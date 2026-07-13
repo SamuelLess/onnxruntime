@@ -203,6 +203,16 @@ class PlannerTest : public ::testing::Test {
     return (name_to_arg_[name] = &graph_.GetOrCreateNodeArg(name, &float_type_.value));
   }
 
+  // Creates a NodeArg with the given tensor element type. Must be called before the first
+  // plain Arg()/AddNode() reference to the name, which would default the type to float.
+  onnxruntime::NodeArg* Arg(const std::string& name, ONNX_NAMESPACE::TensorProto_DataType elem_type) {
+    auto iter = name_to_arg_.find(name);
+    if (name_to_arg_.end() != iter) return iter->second;
+    ONNX_NAMESPACE::TypeProto type_proto;
+    type_proto.mutable_tensor_type()->set_elem_type(elem_type);
+    return (name_to_arg_[name] = &graph_.GetOrCreateNodeArg(name, &type_proto));
+  }
+
   onnxruntime::Node* AddNode(::onnxruntime::KernelDef& kernel_def, std::string& input, std::string& output) {
     auto node = std::make_unique<UnaryNode>(graph_, kernel_def.OpName(), Arg(input), Arg(output));
     auto* p_node = node->p_node;
@@ -348,6 +358,12 @@ class PlannerTest : public ::testing::Test {
     }
   }
 
+  AllocKind GetAllocKind(const std::string& name) {
+    int id;
+    index(name, id);
+    return plan_->allocation_plan[id].alloc_kind;
+  }
+
   void CheckAllocKind(const std::string& name, AllocKind kind) {
     int id;
     index(name, id);
@@ -443,6 +459,88 @@ TEST_F(PlannerTest, ChainTest) {
   CheckFreed(1, {});
   CheckFreed(2, {B});
   CheckFreed(3, {X});
+}
+
+/* FreelistReuseAcrossSameSizeElementTypes: Freelist reuse compares element *sizes*, not element
+   types: a freed float buffer can be reused for an int32 output of the same shape (both 4 bytes)
+   and vice versa. Pins the behavior of the cached element_size in PlannerImpl::FindReusableTensor. */
+TEST_F(PlannerTest, FreelistReuseAcrossSameSizeElementTypes) {
+  // Two disjoint chains, one float and one int32, with identical shapes. Whichever chain is
+  // scheduled first has its intermediate freed before the other chain's intermediate is
+  // planned, so exactly one of A2/B2 must reuse the other's buffer across element types.
+  // (Which one depends on the topological ordering of the independent chains, an
+  // implementation detail this test intentionally does not pin.)
+  std::string A1("A1"), A2("A2"), A3("A3"), B1("B1"), B2("B2"), B3("B3");
+  Arg(B1, TensorProto_DataType_INT32);
+  Arg(B2, TensorProto_DataType_INT32);
+  Arg(B3, TensorProto_DataType_INT32);
+
+  AddNormalNode(A1, A2);
+  AddNormalNode(A2, A3);
+  AddNormalNode(B1, B2);
+  AddNormalNode(B2, B3);
+
+  Shape shape1{50, 100};
+  auto shape = &shape1.value;
+  SetShape({{A1, shape}, {A2, shape}, {A3, shape}, {B1, shape}, {B2, shape}, {B3, shape}});
+
+  CreatePlan();
+
+  const bool a2_reuses = GetAllocKind(A2) == AllocKind::kReuse;
+  const bool b2_reuses = GetAllocKind(B2) == AllocKind::kReuse;
+  EXPECT_NE(a2_reuses, b2_reuses)
+      << "exactly one intermediate should reuse the other's same-sized buffer across element types";
+}
+
+/* FreelistNoReuseDifferentElementSize: same shape but different element sizes (double vs float)
+   must not reuse. Same two-chain structure as FreelistReuseAcrossSameSizeElementTypes, where a
+   matching element size makes one intermediate reuse the other; with mismatched sizes both must
+   allocate, regardless of which chain is scheduled first. */
+TEST_F(PlannerTest, FreelistNoReuseDifferentElementSize) {
+  std::string A1("A1"), A2("A2"), A3("A3"), B1("B1"), B2("B2"), B3("B3");
+  Arg(A1, TensorProto_DataType_DOUBLE);
+  Arg(A2, TensorProto_DataType_DOUBLE);
+  Arg(A3, TensorProto_DataType_DOUBLE);
+
+  AddNormalNode(A1, A2);
+  AddNormalNode(A2, A3);
+  AddNormalNode(B1, B2);
+  AddNormalNode(B2, B3);
+
+  Shape shape1{50, 100};
+  auto shape = &shape1.value;
+  SetShape({{A1, shape}, {A2, shape}, {A3, shape}, {B1, shape}, {B2, shape}, {B3, shape}});
+
+  CreatePlan();
+
+  // 8-byte vs 4-byte elements: no reuse in either direction despite matching shapes.
+  CheckAllocKind(A2, AllocKind::kAllocate);
+  CheckAllocKind(B2, AllocKind::kAllocate);
+}
+
+/* FreelistNoReuseStringTensors: string tensors are never reused (they require placement
+   new/delete), even when shapes and element types match exactly. Same chain as ChainTest,
+   where the third output reuses the first for non-string tensors. */
+TEST_F(PlannerTest, FreelistNoReuseStringTensors) {
+  std::string X1("X1"), X2("X2"), X3("X3"), X4("X4"), X5("X5");
+  for (auto* name : {&X1, &X2, &X3, &X4, &X5}) {
+    Arg(*name, TensorProto_DataType_STRING);
+  }
+
+  AddNormalNode(X1, X2);
+  AddNormalNode(X2, X3);
+  AddNormalNode(X3, X4);
+  AddNormalNode(X4, X5);
+
+  Shape shape1{50, 100};
+  auto shape = &shape1.value;
+  SetShape({{X2, shape}, {X3, shape}, {X4, shape}, {X5, shape}});
+
+  CreatePlan();
+
+  // X2 is freed before X4 is planned and shapes match, but string tensors must not be reused
+  // (kReuse here is the ChainTest expectation for float tensors).
+  CheckAllocKind(X4, AllocKind::kAllocate);
 }
 
 /* InputOutputTest: Test that:

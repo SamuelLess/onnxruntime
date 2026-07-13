@@ -212,14 +212,12 @@ class PlannerImpl {
     OrtValueIndex inplace_reused_buffer_index = -1;  // index of original buffer to reuse inplace
 #endif
 
-    // Cached type properties, populated once in ProcessDef to avoid repeated expensive lookups
-    // (GetElementSize involves multiple hash-map lookups and virtual calls).
-    size_t element_size = 0;        // byte size of one element, 0 for non-tensors
-    int32_t elem_type = -1;         // ONNX TensorProto_DataType enum, -1 for non-tensors
-    bool is_string_tensor = false;  // true if elem_type == TensorProto_DataType_STRING
-#if !defined(DISABLE_OPTIONAL_TYPE)
-    bool is_optional_type = false;  // true if TypeProto::kOptionalType
-#endif
+    // Byte size of one tensor element, cached once in ProcessDef to avoid repeated expensive
+    // lookups in FindReusableTensor (GetElementSize involves hash-map lookups and virtual calls).
+    // 0 marks values that never participate in freelist reuse: non-tensors, string tensors
+    // (which need placement new/delete), sparse and optional tensors, and tensors with an
+    // undefined element type.
+    size_t element_size = 0;
   };
 
   // ort_value_info_ is indexed by an OrtValueIndex
@@ -291,21 +289,15 @@ class PlannerImpl {
 
     info.p_def_site = p_def_site;
 
-    // Cache type properties to avoid repeated expensive lookups in FindReusableTensor.
+    // Cache the element size to avoid repeated expensive lookups in FindReusableTensor.
     const auto* type_proto = p_def_site->TypeAsProto();
-    if (type_proto != nullptr && type_proto->value_case() == ONNX_NAMESPACE::TypeProto::kTensorType) {
-      info.elem_type = type_proto->tensor_type().elem_type();
-      info.is_string_tensor = (info.elem_type == ONNX_NAMESPACE::TensorProto_DataType_STRING);
-      info.element_size = info.is_string_tensor ? 0 : GetElementSize(p_def_site->Type());
+    if (type_proto != nullptr && type_proto->value_case() == ONNX_NAMESPACE::TypeProto::kTensorType &&
+        utils::HasElemType(type_proto->tensor_type()) &&
+        type_proto->tensor_type().elem_type() != ONNX_NAMESPACE::TensorProto_DataType_STRING) {
+      info.element_size = GetElementSize(p_def_site->Type());
     } else {
-      info.elem_type = -1;
       info.element_size = 0;
-      info.is_string_tensor = false;
     }
-#if !defined(DISABLE_OPTIONAL_TYPE)
-    info.is_optional_type = (type_proto != nullptr &&
-                             type_proto->value_case() == ONNX_NAMESPACE::TypeProto::kOptionalType);
-#endif
   }
 
   // Reuse/Alias/Share between two OrtValue indexes
@@ -588,49 +580,40 @@ class PlannerImpl {
     auto p_required_buffer_shape = context_->GetShape(output_arg);
     if (nullptr == p_required_buffer_shape || p_required_buffer_shape->dim_size() == 0) return false;
 
-    // Look up the output_arg's cached properties (computed once in ProcessDef).
+    // Look up the output_arg's cached element size (computed once in ProcessDef).
     const auto output_index = Index(output_arg.Name());
-    const auto& output_info = ort_value_info_[output_index];
+    const auto& output_info = ort_value_info_.at(static_cast<size_t>(output_index));
 
-    // String tensors are never reusable.
-    if (output_info.is_string_tensor) return false;
+    // element_size == 0 marks values that never participate in reuse
+    // (string/sparse/optional/non-tensor values).
+    if (output_info.element_size == 0) return false;
 
     auto& required_memory_info = AllocPlan(output_index).location;
 
     for (auto it = freelist_.begin(); it != freelist_.end(); ++it) {
-      size_t reusable = static_cast<size_t>(it->ml_value);
-      const auto& candidate_info = ort_value_info_.at(reusable);
+      const OrtValueIndex reusable = it->ml_value;
+      const auto& candidate_info = ort_value_info_.at(static_cast<size_t>(reusable));
 
       if (!candidate_info.p_def_site) {
         // TODO this should be an error case, needs more investigation
         continue;
       }
 
-      // Skip string tensors (can't be reused due to placement-new semantics).
-      if (candidate_info.is_string_tensor) continue;
+      // Cheapest check first. A zero element size rules out candidates that can never be
+      // reused (string tensors need placement new/delete, optional tensors may statically be
+      // None, sparse/non-tensor values have no fixed-size buffer). Note that reuse across
+      // different element types of the same size (e.g. float reusing an int32 buffer) is
+      // intentionally preserved.
+      if (candidate_info.element_size != output_info.element_size) continue;
 
-#if !defined(DISABLE_OPTIONAL_TYPE)
-      // Make sure optional types are not up for re-use as we aren't quite
-      // sure if the re-used tensor will be a None or otherwise. This cannot
-      // be determined statically.
-      if (candidate_info.is_optional_type) {
-        continue;
-      }
-#endif
-
-      auto& available_memory_info = AllocPlan(candidate_info.p_def_site->Name()).location;
+      auto& available_memory_info = AllocPlan(reusable).location;
       if (!(available_memory_info == required_memory_info)) continue;
       auto p_available_buffer_shape = context_->GetShape(*candidate_info.p_def_site);
-      if (nullptr != p_available_buffer_shape) {
-        // Compare element sizes using cached values, then check shapes.
-        // Same elem_type implies same element_size, so we can skip the size comparison.
-        bool same_element_size = (candidate_info.elem_type == output_info.elem_type) ||
-                                 (candidate_info.element_size == output_info.element_size);
-        if (same_element_size && SameShape(*p_available_buffer_shape, *p_required_buffer_shape)) {
-          *reusable_tensor = it->ml_value;
-          freelist_.erase(it);
-          return true;
-        }
+      if (nullptr != p_available_buffer_shape &&
+          SameShape(*p_available_buffer_shape, *p_required_buffer_shape)) {
+        *reusable_tensor = reusable;
+        freelist_.erase(it);
+        return true;
       }
     }
     return false;
@@ -2373,13 +2356,6 @@ class PlannerImpl {
     auto& type_proto = ONNX_NAMESPACE::Utils::DataTypeUtils::ToTypeProto(ptype);
     return !utils::HasTensorType(type_proto);
   }
-
-#if !defined(DISABLE_OPTIONAL_TYPE)
-  static bool IsOptionalType(const onnxruntime::NodeArg& nodearg) {
-    const auto* type_proto = nodearg.TypeAsProto();
-    return type_proto->value_case() == ONNX_NAMESPACE::TypeProto::kOptionalType;
-  }
-#endif
 
 // For in-place reuse tensors, the lifetime is the union of all the tensors that tensors that use that buffer
 #if !defined(ORT_MINIMAL_BUILD) && defined(ORT_MEMORY_PROFILE)
